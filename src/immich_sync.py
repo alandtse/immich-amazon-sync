@@ -8,9 +8,15 @@ stdlib only.
 
 Features:
   - One-way sync: Immich albums → Amazon Photos album (files live in root)
-  - Deletion: photos removed from all Immich albums are removed from the
-    Amazon album and (optionally) trashed - guarded by a deletion brake
-  - State tracking: maps Immich asset IDs → Amazon node IDs in a JSON file
+  - Two sync modes: 'mirror' (album equals the Immich albums) and
+    'accumulate' (photos stay after they leave Immich, so the Echo Show
+    slideshow has a larger pool to pick from)
+  - Deletion: in mirror mode photos removed from all Immich albums are
+    removed from the Amazon album and (optionally) trashed - guarded by a
+    deletion brake. In accumulate mode nothing is deleted unless an explicit
+    PRUNE_MODE policy selects it.
+  - State tracking: maps Immich asset IDs → Amazon node IDs in a JSON file,
+    with first-added / last-seen timestamps for age- and count-based pruning
   - Deduplication: skips assets already synced (by ID); upload conflicts are
     resolved by MD5 so existing Amazon nodes are adopted, not duplicated
   - Region aware: amazon.de by default, any TLD via AP_TLD
@@ -27,6 +33,7 @@ import re
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
 from urllib.parse import quote, urlsplit
@@ -57,7 +64,10 @@ AMAZON_PAGE_SIZE = 200  # max nodes per GET /nodes request
 AMAZON_MAX_OFFSET = 9999  # Amazon refuses offset + limit > 9999
 AMAZON_BATCH_SIZE = 50  # nodes per album/trash PATCH (amazon-photos uses 50)
 DOWNLOAD_CHUNK = 1024 * 1024
-STATE_VERSION = 2
+STATE_VERSION = 3
+
+SYNC_MODES = ("mirror", "accumulate")
+PRUNE_MODES = ("none", "max_count", "keep_recent", "both")
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -78,6 +88,10 @@ AMAZON_DRIVE_URL: str = ""
 AMAZON_CONTENT_URL: str = ""
 AP_ALBUM_NAME: str = ""
 DELETE_MODE: str = "trash"
+SYNC_MODE: str = "mirror"
+PRUNE_MODE: str = "none"
+PRUNE_MAX_COUNT: int = 0
+PRUNE_KEEP_RECENT_DAYS: float = 0
 DRY_RUN: bool = False
 MAX_DELETE_FRACTION: float = 0.2
 MAX_DELETE_COUNT: int = 50
@@ -208,6 +222,7 @@ def _configure() -> None:
     """Read env vars and set up module-level config. Called once from main()."""
     global IMMICH_URL, ALBUMS_TO_SYNC, AP_HEADERS, IMMICH_HEADERS
     global AMAZON_DRIVE_URL, AMAZON_CONTENT_URL, AP_ALBUM_NAME, DELETE_MODE, DRY_RUN
+    global SYNC_MODE, PRUNE_MODE, PRUNE_MAX_COUNT, PRUNE_KEEP_RECENT_DAYS
     global MAX_DELETE_FRACTION, MAX_DELETE_COUNT, MAX_FILE_BYTES, SYNC_TYPES
     global HEALTHCHECK_URL, STATE_DIR, STATE_FILE
 
@@ -258,6 +273,25 @@ def _configure() -> None:
     DELETE_MODE = _env("AP_DELETE_MODE", "trash").lower()
     if DELETE_MODE not in ("trash", "album_only"):
         raise ConfigError("AP_DELETE_MODE must be 'trash' or 'album_only'")
+
+    SYNC_MODE = _env("SYNC_MODE", "mirror").lower()
+    if SYNC_MODE not in SYNC_MODES:
+        raise ConfigError("SYNC_MODE must be 'mirror' or 'accumulate'")
+
+    PRUNE_MODE = _env("PRUNE_MODE", "none").lower()
+    if PRUNE_MODE not in PRUNE_MODES:
+        raise ConfigError(
+            "PRUNE_MODE must be 'none', 'max_count', 'keep_recent' or 'both'"
+        )
+    PRUNE_MAX_COUNT = _env_number("PRUNE_MAX_COUNT", 0, int)
+    PRUNE_KEEP_RECENT_DAYS = _env_number("PRUNE_KEEP_RECENT_DAYS", 0)
+    if PRUNE_MODE in ("max_count", "both") and PRUNE_MAX_COUNT < 1:
+        raise ConfigError("PRUNE_MODE needs PRUNE_MAX_COUNT >= 1")
+    if PRUNE_MODE in ("keep_recent", "both") and PRUNE_KEEP_RECENT_DAYS <= 0:
+        raise ConfigError("PRUNE_MODE needs PRUNE_KEEP_RECENT_DAYS > 0")
+    if PRUNE_MODE != "none" and SYNC_MODE != "accumulate":
+        # in mirror mode PRUNE_* would silently do nothing - say so instead
+        raise ConfigError("PRUNE_MODE requires SYNC_MODE=accumulate")
 
     DRY_RUN = _env_bool("DRY_RUN")
     MAX_DELETE_FRACTION = _env_number("MAX_DELETE_FRACTION", 0.2)
@@ -471,15 +505,37 @@ def _disambiguated_name(name: str, asset_id: str) -> str:
 
 
 # State
-# state.json schema (v2):
-# {"version": 2, "album_node_id": "<amazon album id>" | null,
+# state.json schema (v3):
+# {"version": 3, "album_node_id": "<amazon album id>" | null,
 #  "synced": {"<immich_asset_id>": "<amazon_node_id>", ...},
-#  "pending_album_add": ["<amazon_node_id>", ...]}
+#  "pending_album_add": ["<amazon_node_id>", ...],
+#  "adopted_nodes": ["<amazon_node_id>", ...],
+#  "first_added": {"<immich_asset_id>": "<iso8601 utc>", ...},
+#  "last_seen": {"<immich_asset_id>": "<iso8601 utc>", ...}}
+#
+# `last_seen` is refreshed on every run for assets still in Immich albums, so
+# "how long ago did this photo leave Immich" is known in accumulate mode.
+# `first_added` is retained as a migration fallback and audit timestamp.
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_iso(value) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _empty_state() -> dict:
     return {"version": STATE_VERSION, "album_node_id": None, "synced": {},
-            "pending_album_add": [], "adopted_nodes": []}
+            "pending_album_add": [], "adopted_nodes": [],
+            "first_added": {}, "last_seen": {}}
 
 
 def load_state() -> dict:
@@ -504,9 +560,11 @@ def load_state() -> dict:
             synced=dict(data.get("synced") or {}),
             pending_album_add=list(data.get("pending_album_add") or []),
             adopted_nodes=list(data.get("adopted_nodes") or []),
+            first_added=dict(data.get("first_added") or {}),
+            last_seen=dict(data.get("last_seen") or {}),
         )
         return state
-    if version != 1:
+    if version not in (1, 2):
         raise FatalError(f"State file version {version} is newer than this tool supports.")
 
     state = _empty_state()
@@ -517,7 +575,18 @@ def load_state() -> dict:
         )
         return state
     state["synced"] = dict(data.get("synced") or {})
-    log.info(f"Migrating state v1 → v2 ({len(state['synced'])} tracked assets, no re-upload)")
+    state["album_node_id"] = data.get("album_node_id")
+    state["pending_album_add"] = list(data.get("pending_album_add") or [])
+    state["adopted_nodes"] = list(data.get("adopted_nodes") or [])
+    # v1/v2 carry no timestamps. Treat their age as unknown/new for retention
+    # purposes so keep_recent cannot immediately delete legacy Amazon copies.
+    stamp = _now_iso()
+    for asset_id in state["synced"]:
+        state["first_added"].setdefault(asset_id, stamp)
+    log.info(
+        f"Migrating state v{version} → v{STATE_VERSION} "
+        f"({len(state['synced'])} tracked assets, no re-upload)"
+    )
     return state
 
 
@@ -925,6 +994,45 @@ def _resolve_albums() -> tuple[list[tuple[str, str]], bool]:
     return targets, all_found
 
 
+def _retired_timestamp(state: dict, asset_id: str) -> datetime:
+    """When this asset was last known to be part of an Immich album."""
+    for key in ("last_seen", "first_added"):
+        parsed = _parse_iso(state[key].get(asset_id))
+        if parsed:
+            return parsed
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def select_prune_candidates(state: dict, retired: list[str]) -> list[str]:
+    """Pick retired assets to recycle according to PRUNE_MODE, oldest first.
+
+    Only assets that already left the Immich albums are candidates. Pruning a
+    photo that is still in an Immich album would just re-add it on the next run
+    and defeat the whole point of pruning.
+    """
+    if PRUNE_MODE == "none":
+        return []
+    ordered = sorted(retired, key=lambda a: (_retired_timestamp(state, a), a))
+    chosen: set[str] = set()
+    if PRUNE_MODE in ("max_count", "both"):
+        # The limit applies to the whole accumulated Amazon set, not just this
+        # run's retired assets. Never prune assets still present in Immich.
+        overflow = max(0, len(state["synced"]) - PRUNE_MAX_COUNT)
+        prune_count = min(overflow, len(ordered))
+        if prune_count:
+            chosen.update(ordered[:prune_count])
+        if prune_count < overflow:
+            active_count = len(state["synced"]) - len(ordered)
+            log.warning(
+                f"PRUNE_MAX_COUNT={PRUNE_MAX_COUNT} cannot be met: {active_count} asset(s) "
+                "are still in Immich albums and will not be pruned"
+            )
+    if PRUNE_MODE in ("keep_recent", "both"):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=PRUNE_KEEP_RECENT_DAYS)
+        chosen.update(a for a in ordered if _retired_timestamp(state, a) < cutoff)
+    return sorted(chosen, key=lambda a: (_retired_timestamp(state, a), a))
+
+
 def run() -> int:
     log.info("Starting Immich → Amazon Photos sync" + (" [DRY RUN]" if DRY_RUN else ""))
     state = load_state()
@@ -993,7 +1101,7 @@ def run() -> int:
                  f"{'/'.join(sorted(SYNC_TYPES))}")
 
     new_assets = [a for asset_id, a in wanted.items() if asset_id not in synced]
-    log.info(f"{len(wanted)} assets to mirror, {len(new_assets)} new")
+    log.info(f"{len(wanted)} assets in source albums, {len(new_assets)} new to sync")
 
     tracked_before = len(synced)  # deletion brake base, excluding this run's uploads
     total_uploaded = 0
@@ -1019,6 +1127,8 @@ def run() -> int:
                 continue
             log.info(f"  {how.capitalize()}: {name} → {node_id}")
             synced[asset_id] = node_id
+            state["first_added"].setdefault(asset_id, _now_iso())
+            state["last_seen"][asset_id] = _now_iso()
             state["pending_album_add"].append(node_id)
             if how == "adopted" and node_id not in state["adopted_nodes"]:
                 # not uploaded by us (could be the user's own backup): never trash it
@@ -1031,28 +1141,54 @@ def run() -> int:
         errors += flush_pending_album_adds(state)
         synced = state["synced"]
 
-    # Delete assets that were removed from all target albums
+    # Refresh the timestamps used by age-based pruning. Assets seen in an Immich
+    # album now get a fresh last_seen; new uploads are stamped as first_added.
+    stamp = _now_iso()
+    for asset_id in present_ids:
+        if asset_id in synced:
+            state["last_seen"][asset_id] = stamp
+            state["first_added"].setdefault(asset_id, stamp)
+    save_state(state)
+
+    # Assets that left all target albums since the last run
     removed = sorted(set(synced) - present_ids)
+    if SYNC_MODE == "mirror":
+        candidates = removed
+    else:
+        if removed:
+            log.info(
+                f"Accumulate mode: keeping {len(removed)} retired asset(s) "
+                f"(PRUNE_MODE={PRUNE_MODE})"
+            )
+        candidates = select_prune_candidates(state, removed)
+        if candidates:
+            log.info(f"Prune policy {PRUNE_MODE}: {len(candidates)} retired asset(s) selected")
+
     total_deleted = 0
     delete_blocked = False
-    if removed:
-        fraction = len(removed) / max(tracked_before, 1)
+    if candidates:
+        fraction = len(candidates) / max(tracked_before, 1)
         if not immich_complete:
-            log.error(f"Not deleting {len(removed)} asset(s): Immich data incomplete in this run")
+            log.error(f"Not deleting {len(candidates)} asset(s): Immich data incomplete in this run")
             delete_blocked = True
-        elif len(removed) > MAX_DELETE_COUNT or fraction > MAX_DELETE_FRACTION:
+        elif SYNC_MODE == "accumulate" and errors:
             log.error(
-                f"Deletion brake: {len(removed)} of {tracked_before} tracked assets "
+                f"Not pruning {len(candidates)} asset(s): {errors} sync error(s) occurred this run"
+            )
+            delete_blocked = True
+        elif len(candidates) > MAX_DELETE_COUNT or fraction > MAX_DELETE_FRACTION:
+            log.error(
+                f"Deletion brake: {len(candidates)} of {tracked_before} tracked assets "
                 f"({fraction:.0%}) would be deleted (limits: MAX_DELETE_COUNT={MAX_DELETE_COUNT}, "
                 f"MAX_DELETE_FRACTION={MAX_DELETE_FRACTION:g}). Nothing deleted."
             )
             delete_blocked = True
         elif DRY_RUN:
-            for asset_id in removed:
+            for asset_id in candidates:
                 log.info(f"  [dry-run] Would remove {asset_id} ({synced[asset_id]}) "
                          f"from album{' and trash it' if DELETE_MODE == 'trash' else ''}")
         else:
-            total_deleted, delete_errors = delete_assets(state, removed)
+            total_deleted, delete_errors = delete_assets(state, candidates)
             errors += delete_errors
             synced = state["synced"]
 
@@ -1092,6 +1228,8 @@ def delete_assets(state: dict, asset_ids: list[str]) -> tuple[int, int]:
         if synced[asset_id] in still_used:
             log.info(f"  Forgetting {asset_id}: its node is still used by another asset")
             del synced[asset_id]
+            state["first_added"].pop(asset_id, None)
+            state["last_seen"].pop(asset_id, None)
         else:
             node_to_assets.setdefault(synced[asset_id], []).append(asset_id)
     node_ids = list(node_to_assets)
@@ -1124,6 +1262,8 @@ def delete_assets(state: dict, asset_ids: list[str]) -> tuple[int, int]:
             action = "Trashed" if node_id in to_trash else "Removed from album"
             for asset_id in node_to_assets[node_id]:
                 del synced[asset_id]
+                state["first_added"].pop(asset_id, None)
+                state["last_seen"].pop(asset_id, None)
                 log.info(f"  {action}: {asset_id} ({node_id})")
         state["pending_album_add"] = [n for n in state["pending_album_add"] if n not in finished]
         state["adopted_nodes"] = [n for n in state["adopted_nodes"] if n not in finished]

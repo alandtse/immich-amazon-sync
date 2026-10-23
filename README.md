@@ -22,8 +22,21 @@ Immich albums ──(search/metadata, download original)──▶ Amazon Drive v
 
 - Every run collects all assets of the configured Immich albums (non-trashed, visibility `timeline` or `archive`, i.e. exactly what the album shows).
 - New assets are downloaded, streamed to the Amazon Photos root folder and then added to the album `AP_ALBUM_NAME` in batches.
-- Assets that are no longer in **any** of the configured albums are removed from the Amazon album and, with `AP_DELETE_MODE=trash` (the default), moved to the Amazon trash. Only nodes this tool uploaded or adopted (those listed in the state file) are ever touched.
-- The state file maps Immich asset IDs to Amazon node IDs and is saved after every upload.
+- In `SYNC_MODE=mirror`, assets no longer in **any** configured album are removed from the Amazon album and, with `AP_DELETE_MODE=trash` (the default), moved to Amazon trash.
+- In `SYNC_MODE=accumulate`, assets that leave Immich stay in the Amazon album to increase the Echo Show's rotation pool. `PRUNE_MODE=none` keeps them indefinitely; optional pruning only considers retired assets, never assets still in a source album. The `.env.example` starts in accumulate mode. Deleting an asset in Immich does not delete its Amazon copy in accumulate mode.
+- Only nodes this tool uploaded or adopted (those listed in the state file) are ever touched. The state file maps Immich asset IDs to Amazon node IDs and is saved after every upload.
+
+## Sync modes and retention
+
+`SYNC_MODE=mirror` preserves the original behavior and is the code fallback when the variable is omitted. It removes assets from the Amazon album when they leave all configured Immich albums. `SYNC_MODE=accumulate` is the example configuration: it keeps those Amazon copies so a rotating or periodically refilled Immich album builds a larger slideshow pool. In accumulate mode, an Immich deletion is not propagated to Amazon unless an explicit prune policy selects that retired asset; consider the privacy implications before enabling it.
+
+Accumulation pruning is disabled by default (`PRUNE_MODE=none`). Optional policies:
+
+- `max_count`: prune the oldest retired assets when the total tracked set exceeds `PRUNE_MAX_COUNT`.
+- `keep_recent`: prune retired assets whose last-seen time in Immich is older than `PRUNE_KEEP_RECENT_DAYS`.
+- `both`: apply both rules (a retired asset is eligible if either rule selects it).
+
+Active source-album assets are never pruned. If they alone exceed `PRUNE_MAX_COUNT`, the cap cannot be met; the tool warns and preserves them. Pruning uses the same incomplete-data guard, dry-run behavior and deletion brake as mirror mode; any sync error also blocks pruning for that run. When the brake blocks a prune run, the tool exits with code 2 and retains all candidates for a later run. `PRUNE_MODE` requires `SYNC_MODE=accumulate`; count and age values must be supplied when their policy is selected. `AP_DELETE_MODE=trash` moves pruned nodes to Amazon trash; `album_only` only removes them from the target album.
 
 ## Requirements
 
@@ -198,6 +211,10 @@ Without Swarm, Compose bind-mounts the secret files, so they must be readable by
 | `AP_CONTENT_URL` | Override the upload host, e.g. `https://content-eu.drive.amazonaws.com/cdproxy` | derived |
 | `AP_USER_AGENT` | User-Agent sent to Amazon | recent Chrome |
 | `AP_DELETE_MODE` | `trash` (remove from album and move to trash) or `album_only` | `trash` |
+| `SYNC_MODE` | `mirror` (remove retired assets) or `accumulate` (retain retired assets) | `mirror` |
+| `PRUNE_MODE` | `none`, `max_count`, `keep_recent` or `both`; requires accumulate | `none` |
+| `PRUNE_MAX_COUNT` | Total tracked assets allowed when using `max_count` / `both` | - |
+| `PRUNE_KEEP_RECENT_DAYS` | Retention window for `keep_recent` / `both` | - |
 | `DRY_RUN` | Log the plan only; write nothing to Amazon or the state file | `false` |
 | `MAX_DELETE_FRACTION` | Deletion brake: maximum share of tracked assets deleted per run | `0.2` |
 | `MAX_DELETE_COUNT` | Deletion brake: maximum number of assets deleted per run | `50` |
@@ -221,7 +238,7 @@ Every variable can also be read from a file via `<NAME>_FILE`.
 
 ## Deletion safety
 
-Deletions only happen when **all** of the following are true:
+In mirror mode, removals happen when **all** of the following are true. Accumulate-mode pruning uses the same guards:
 
 - Every album in `IMMICH_ALBUMS` was found, exactly once.
 - Every Immich query succeeded.
@@ -242,16 +259,19 @@ Changing `SYNC_TYPES` does not delete anything: only assets that left all Immich
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "album_node_id": "amazon-album-node-id",
   "synced": { "immich-asset-uuid": "amazon-node-id" },
   "pending_album_add": [],
-  "adopted_nodes": []
+  "adopted_nodes": [],
+  "first_added": { "immich-asset-uuid": "2026-01-01T00:00:00+00:00" },
+  "last_seen": { "immich-asset-uuid": "2026-01-01T00:00:00+00:00" }
 }
 ```
 
+- `first_added` and `last_seen` store UTC timestamps used by age-based pruning. `last_seen` is refreshed while an asset remains in a configured Immich album; age retention is measured from when the asset left the source album.
 - `pending_album_add` holds uploaded nodes that are not yet linked to the album. They are linked on the next run, so an interrupted run loses nothing.
-- `adopted_nodes` holds nodes that already existed on Amazon (same MD5, found via a 409 conflict), for example a copy from the phone's own Amazon Photos backup. They are linked to the album but, when the photo leaves Immich, they are **only removed from the album and never trashed**.
+- `adopted_nodes` holds nodes that already existed on Amazon (same MD5, found via a 409 conflict), for example a copy from the phone's own Amazon Photos backup. They are linked to the album and are **never trashed**. In mirror mode or when an explicit prune policy removes one, it is only removed from the album.
 - The upstream format (`{"synced": {...}}`) is migrated automatically without re-uploading. On the first run, all previously synced photos are added to the album.
 - If the album is deleted or renamed in Amazon Photos, it is looked up by name or recreated, and all tracked photos are linked again.
 - If the state file is corrupt, the run aborts instead of silently starting from scratch.

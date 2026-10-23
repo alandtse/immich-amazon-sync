@@ -67,6 +67,10 @@ AP_TLD=de
 AP_ALBUM_NAME=Echo Show
 AP_DELETE_MODE=trash
 AP_USER_AGENT=$UA
+SYNC_MODE=accumulate
+PRUNE_MODE=none
+# Optional: PRUNE_MODE=max_count + PRUNE_MAX_COUNT=1000
+# Optional: PRUNE_MODE=keep_recent + PRUNE_KEEP_RECENT_DAYS=365
 SYNC_TYPES=IMAGE
 MAX_FILE_MB=200
 SYNC_INTERVAL_HOURS=6
@@ -245,6 +249,11 @@ AP_ALBUM_NAME=Echo Show
 AP_DELETE_MODE=trash
 AP_USER_AGENT=HIER_DEN_USER_AGENT_AUS_SCHRITT_3_EINFUEGEN
 
+SYNC_MODE=accumulate
+PRUNE_MODE=none
+# Optional: PRUNE_MODE=max_count + PRUNE_MAX_COUNT=1000
+# Optional: PRUNE_MODE=keep_recent + PRUNE_KEEP_RECENT_DAYS=365
+
 SYNC_TYPES=IMAGE
 MAX_FILE_MB=200
 SYNC_INTERVAL_HOURS=6
@@ -375,19 +384,17 @@ Neue Fotos erscheinen auf dem Echo, nachdem der nächste Sync gelaufen ist und d
 ## 10. Alltag
 
 - **Foto hinzufügen:** In Immich ins Album legen. Es erscheint nach dem nächsten Sync.
-- **Foto entfernen:** In Immich aus dem Album nehmen. Beim nächsten Sync wird es aus dem Amazon-Album entfernt und in den Amazon-Papierkorb verschoben. Das Amazon-Album hat damit immer denselben Inhalt wie das Immich-Album, es sammelt sich nichts an.
-  - Mit `AP_DELETE_MODE=album_only` bleibt es stattdessen in der Amazon-Bibliothek.
-  - Fotos, die schon vorher in Amazon Photos lagen (z. B. aus der Handy-Sicherung), werden nie in den Papierkorb verschoben, nur aus dem Album genommen.
+- **Foto aus dem Immich-Album entfernen:** Mit `SYNC_MODE=accumulate` bleibt die Amazon-Kopie im Echo-Show-Album, damit es mit der Zeit mehr Fotos für die Wiedergabe gibt. Das ist die Standardeinstellung in dieser Anleitung. Beim Löschen in Immich wird die Amazon-Kopie also nicht automatisch gelöscht.
+  - Optionales Aufräumen: `PRUNE_MODE=max_count` mit `PRUNE_MAX_COUNT=1000` behält höchstens 1000 nachverfolgte Fotos, sofern genug alte Fotos nicht mehr in Immich-Alben liegen. `PRUNE_MODE=keep_recent` mit `PRUNE_KEEP_RECENT_DAYS=365` entfernt nur Fotos, die seit mehr als 365 Tagen nicht mehr in einem Quellalbum waren. `PRUNE_MODE=both` kombiniert beide Regeln. Aktive Immich-Fotos werden nie aufgeräumt.
+  - `PRUNE_MODE=none` deaktiviert das Aufräumen. Unvollständige Immich-Daten, Sync-Fehler und die Löschbremse verhindern das Aufräumen in diesem Lauf; bei blockierter Löschung wird Exit-Code 2 zurückgegeben.
+  - `SYNC_MODE=mirror` stellt das frühere Verhalten wieder her: Fotos, die aus allen Immich-Quellalben verschwinden, werden beim nächsten Lauf aus dem Amazon-Album entfernt und standardmäßig in den Papierkorb verschoben.
+  - `AP_DELETE_MODE=album_only` entfernt nur aus dem Echo-Show-Album, nicht in den Papierkorb. Fotos, die schon vorher in Amazon Photos lagen (z. B. aus der Handy-Sicherung), werden nie in den Papierkorb verschoben.
   - Fotos, die schon vor dem ersten Sync im Amazon-Album waren, fasst das Tool nicht an. Die einmal von Hand entfernen.
 - **Löschbremse:** Würden in einem Lauf mehr als 20 % oder mehr als 50 der Fotos gelöscht, löscht das Tool gar nichts und meldet `Deletion brake` (Exit-Code 2). Bei kleinen Alben passiert das schnell: 1 von 4 Fotos sind schon 25 %. Wenn das Absicht war, einmalig mit höherer Grenze laufen lassen:
   ```bash
   docker compose run --rm -e RUN_ONCE=true -e MAX_DELETE_FRACTION=1 immich-sync
   ```
-- **Album, das sich oft komplett ändert** (z. B. täglich neu befüllt per Skript oder Automatisierung): Die Löschbremse würde dann jeden Tag greifen, und die alten Fotos blieben drin. Grenzen dauerhaft hochsetzen:
-  ```bash
-  cd ~/immich-amazon-sync && sed -i 's/^MAX_DELETE_FRACTION=.*/MAX_DELETE_FRACTION=1/; s/^MAX_DELETE_COUNT=.*/MAX_DELETE_COUNT=500/' .env && docker compose up -d --force-recreate
-  ```
-  Ein unvollständiger Datenstand aus Immich löscht auch dann nichts: kein Album gefunden, Abfrage fehlgeschlagen oder Anzahl stimmt nicht. Leert die Automatisierung das Album aber kurz komplett und der Sync läuft genau dann, wird auch das Amazon-Album geleert. Beim nächsten Lauf wird alles wieder hochgeladen.
+- **Album, das sich oft komplett ändert** (z. B. regelmäßig neu befüllt per Skript oder Automatisierung): `SYNC_MODE=accumulate` ist dafür gedacht. Verlassene Fotos bleiben als Amazon-Kopien erhalten; die Löschbremse greift nur, wenn du eine optionale Aufräumregel aktivierst. Ein unvollständiger Datenstand aus Immich (kein Album gefunden, Abfrage fehlgeschlagen oder Anzahl stimmt nicht) blockiert das Aufräumen.
 - **Neustart des Docker-Hosts:** Dank `restart: unless-stopped` startet der Container automatisch wieder, sofern Docker beim Booten startet (`systemctl is-enabled docker containerd` sollte zweimal `enabled` ausgeben) und du ihn nicht vorher selbst gestoppt hast. Nach dem Start synchronisiert er sofort. Startet Immich langsamer, schlägt dieser erste Lauf fehl, ohne etwas zu löschen. Der nächste Versuch kommt nach `SYNC_INTERVAL_HOURS`, oder sofort per `docker restart immich-sync`.
 - **Cookies abgelaufen:** Im Log steht `cookies expired or invalid`, Exit-Code 3. Dann:
   1. Schritt 3 wiederholen.

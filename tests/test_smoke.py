@@ -19,11 +19,11 @@ class TestState(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_file = Path(tmp) / "state.json"
             with patch("immich_sync.STATE_FILE", state_file):
-                from immich_sync import load_state, save_state
+                from immich_sync import STATE_VERSION, load_state, save_state
 
                 state = load_state()
                 self.assertEqual(state["synced"], {})
-                self.assertEqual(state["version"], 2)
+                self.assertEqual(state["version"], STATE_VERSION)
 
                 state["synced"] = {"asset1": "node1", "asset2": "node2"}
                 state["album_node_id"] = "album1"
@@ -43,13 +43,35 @@ class TestState(unittest.TestCase):
             state_file = Path(tmp) / "state.json"
             state_file.write_text(json.dumps({"synced": {"a1": "n1", "a2": "n2"}}))
             with patch("immich_sync.STATE_FILE", state_file):
-                from immich_sync import load_state
+                from immich_sync import STATE_VERSION, load_state
 
                 state = load_state()
-                self.assertEqual(state["version"], 2)
+                self.assertEqual(state["version"], STATE_VERSION)
                 self.assertEqual(state["synced"], {"a1": "n1", "a2": "n2"})
                 self.assertIsNone(state["album_node_id"])
                 self.assertEqual(state["pending_album_add"], [])
+
+    def test_migrates_v2_state_without_reupload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = Path(tmp) / "state.json"
+            state_file.write_text(json.dumps({
+                "version": 2,
+                "album_node_id": "album-v2",
+                "synced": {"asset1": "node1"},
+                "pending_album_add": ["node2"],
+                "adopted_nodes": ["node1"],
+            }))
+            with patch("immich_sync.STATE_FILE", state_file):
+                from immich_sync import STATE_VERSION, load_state
+
+                state = load_state()
+                self.assertEqual(state["version"], STATE_VERSION)
+                self.assertEqual(state["album_node_id"], "album-v2")
+                self.assertEqual(state["synced"], {"asset1": "node1"})
+                self.assertEqual(state["pending_album_add"], ["node2"])
+                self.assertEqual(state["adopted_nodes"], ["node1"])
+                self.assertIn("asset1", state["first_added"])
+                self.assertEqual(state["last_seen"], {})
 
     def test_corrupt_state_is_fatal(self):
         with tempfile.TemporaryDirectory() as tmp:
