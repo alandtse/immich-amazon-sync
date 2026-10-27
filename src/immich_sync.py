@@ -62,7 +62,10 @@ MIN_IMMICH_VERSION = (3, 2)
 IMMICH_PAGE_SIZE = 1000  # max allowed by POST /search/metadata
 AMAZON_PAGE_SIZE = 200  # max nodes per GET /nodes request
 AMAZON_MAX_OFFSET = 9999  # Amazon refuses offset + limit > 9999
-AMAZON_BATCH_SIZE = 50  # nodes per album/trash PATCH (amazon-photos uses 50)
+# Amazon caps the `value` array of an album-children PATCH at 25 members
+# ("Member must have length less than or equal to 25"). Exceeding it returns
+# HTTP 400 and forces a slow one-by-one fallback, so stay at the real limit.
+AMAZON_BATCH_SIZE = 25  # nodes per album/trash PATCH (Amazon hard cap is 25)
 DOWNLOAD_CHUNK = 1024 * 1024
 STATE_VERSION = 3
 

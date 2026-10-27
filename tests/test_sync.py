@@ -256,6 +256,50 @@ class TestImmichSearch(SyncTestCase):
         self.assertEqual(self.backend.trashed, set())
 
 
+class TestAmazonBatchLimit(SyncTestCase):
+    """Amazon rejects album-children PATCH value arrays longer than 25.
+
+    Regression: AMAZON_BATCH_SIZE was 50, so every album add/remove returned
+    HTTP 400 and fell back to one node per request (slow, log-noisy).
+    """
+
+    def test_batch_size_respects_amazon_cap(self):
+        self.assertEqual(immich_sync.AMAZON_BATCH_SIZE, 25)
+
+    def test_no_album_patch_exceeds_the_cap(self):
+        ids = [aid(i) for i in range(1, 60)]
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+
+        album_id = self.state()["album_node_id"]
+        patches = [
+            json.loads(data)
+            for method, url, data in self.backend.calls
+            if method == "PATCH" and url.endswith("/children")
+        ]
+        self.assertGreater(len(patches), 1, "expected several batched add calls")
+        for body in patches:
+            self.assertLessEqual(
+                len(body["value"]), 25,
+                f"Amazon rejects value arrays >25 (got {len(body['value'])})",
+            )
+        self.assertEqual(self.backend.album_children[album_id], set(self.state()["synced"].values()))
+
+    def test_batches_are_not_split_when_at_the_cap(self):
+        ids = [aid(i) for i in range(1, 26)]  # exactly 25
+        album = self.backend.add_album("Echo", ids)
+        self.assertEqual(self.run_sync(), immich_sync.EXIT_OK)
+        patches = [
+            json.loads(data)
+            for method, url, data in self.backend.calls
+            if method == "PATCH" and url.endswith("/children")
+        ]
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(len(patches[0]["value"]), 25)
+        self.assertEqual(self.backend.album_children[self.state()["album_node_id"]],
+                         set(self.state()["synced"].values()))
+
+
 class TestFullSync(SyncTestCase):
     def test_upload_into_album_then_idempotent(self):
         ids = [aid(i) for i in range(1, 4)]
