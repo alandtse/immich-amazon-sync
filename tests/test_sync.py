@@ -256,6 +256,60 @@ class TestImmichSearch(SyncTestCase):
         self.assertEqual(self.backend.trashed, set())
 
 
+class TestGzipResponses(SyncTestCase):
+    """Amazon's edge sometimes returns gzip regardless of Accept-Encoding.
+
+    Regression: urllib does not decompress, so the body began with b'\x1f\x8b'
+    and json parsing died with "'utf-8' codec can't decode byte 0x8b". Every
+    such album add was recorded as a failure even though Amazon had accepted it,
+    leaving state.json and the real album contents out of sync.
+    """
+
+    def test_decode_gzip_by_magic_bytes(self):
+        import gzip as _gzip
+        payload = b'{"ok":true}'
+        self.assertEqual(immich_sync._decode_body(_gzip.compress(payload)), payload)
+
+    def test_decode_gzip_by_header(self):
+        import gzip as _gzip
+        payload = b'{"ok":true}'
+        self.assertEqual(immich_sync._decode_body(_gzip.compress(payload), "gzip"), payload)
+
+    def test_decode_passthrough_for_plain_json(self):
+        self.assertEqual(immich_sync._decode_body(b'{"ok":true}'), b'{"ok":true}')
+
+    def test_decode_empty(self):
+        self.assertEqual(immich_sync._decode_body(b""), b"")
+
+    def test_album_patch_succeeds_with_gzip_response(self):
+        """A gzipped 202 must still count as success, not a lost album add."""
+        import gzip as _gzip
+
+        ids = [aid(i) for i in range(1, 6)]
+        self.backend.add_album("Echo", ids)
+        backend = self.backend
+
+        def gzipping(req, timeout=None):
+            resp = backend(req, timeout=timeout)
+            if req.get_method() == "PATCH" and req.full_url.endswith("/children"):
+                body = _gzip.compress(resp.getvalue())
+                return FakeResponse(body, {"Content-Encoding": "gzip",
+                                           "Content-Length": str(len(body))})
+            return resp
+
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch("immich_sync.urlopen", gzipping), \
+                patch("sys.stdout", new_callable=io.StringIO) as out, \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = immich_sync.main()
+        self.output = out.getvalue() + err.getvalue()
+        self.assertEqual(code, immich_sync.EXIT_OK, self.output)
+
+        album_id = self.state()["album_node_id"]
+        self.assertEqual(self.backend.album_children[album_id], set(self.state()["synced"].values()))
+        self.assertEqual(self.state()["pending_album_add"], [])
+
+
 class TestAmazonBatchLimit(SyncTestCase):
     """Amazon rejects album-children PATCH value arrays longer than 25.
 

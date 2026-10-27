@@ -27,9 +27,11 @@ import json
 import logging
 import logging.handlers
 import math
+import gzip
 import mimetypes
 import os
 import re
+import zlib
 import sys
 import tempfile
 import uuid
@@ -385,10 +387,40 @@ def _request(
     method: str | None = None,
     timeout: int = 30,
 ) -> bytes:
-    """Make an HTTP request and return the response body. Raises on non-2xx."""
+    """Make an HTTP request and return the decoded response body. Raises on non-2xx.
+
+    Amazon's edge intermittently returns a gzip body (``Content-Encoding: gzip``)
+    even when the request did not advertise ``Accept-Encoding``. urllib does not
+    decompress, so without this the caller sees the raw ``\x1f\x8b`` magic and
+    fails with "'utf-8' codec can't decode byte 0x8b" while parsing JSON.
+    """
     req = Request(url, data=data, headers=headers or {}, method=method)
     with urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+        raw = resp.read()
+        encoding = (resp.headers.get("Content-Encoding") or "").lower().strip()
+        return _decode_body(raw, encoding)
+
+
+def _decode_body(raw: bytes, encoding: str = "") -> bytes:
+    """Transparently undo Content-Encoding and sniff gzip/deflate by magic bytes."""
+    if not raw:
+        return raw
+    if encoding in ("gzip", "x-gzip") or raw[:2] == b"\x1f\x8b":
+        try:
+            return gzip.decompress(raw)
+        except (OSError, EOFError, zlib.error):
+            if encoding:
+                raise
+    if encoding == "deflate" or raw[:1] == b"\x78":
+        try:
+            return zlib.decompress(raw)
+        except zlib.error:
+            try:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+            except zlib.error:
+                if encoding:
+                    raise
+    return raw
 
 
 def _json_request(
@@ -404,10 +436,16 @@ def _json_request(
 
 
 def _error_body(e: HTTPError, limit: int = 4096) -> str:
+    """Error payload as text. Amazon gzips some error bodies, so decode first."""
     try:
-        return e.read(limit).decode("utf-8", "replace")
+        raw = e.read()
     except Exception:
         return ""
+    try:
+        raw = _decode_body(raw, (e.headers.get("Content-Encoding") if e.headers else "") or "")
+    except Exception:
+        pass
+    return raw[:limit].decode("utf-8", "replace")
 
 
 # Streaming multipart form-data encoder
